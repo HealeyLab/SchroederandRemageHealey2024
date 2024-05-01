@@ -1,0 +1,1396 @@
+---
+title: "Xfostering_StatisticalAnalysis"
+author: Anonymous
+date: "2023-07-25"
+output:
+  #pdf_document: default
+  html_document: default
+---
+This document includes code for the process of model selection and diagnostics tests for each response variable. Code for the final models and post hoc tests are also included in the XofsteringCh2.R.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+                      #tidy = TRUE,tidy.opts=list(width.cutoff=50))
+```
+
+```{r Load libraries,include=FALSE,warning=FALSE}
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(emmeans)
+library(glmmTMB)
+library(DHARMa)
+library(bbmle)  #masks slice from dplyr, so need to reload that package before making coherency_cleaned df.
+library(ggplot2)
+```
+
+# PROJECT OVERVIEW 
+* Question: Does early auditory and social experience affect how a fledgling brain responds to species-specific songs?
+* Response variables: spontaneous firing rate, evoked firing rate, Z-score, accuracy, latency, d prime, proportion selective (d' > 0.7), proportion responsive (Wilcoxon test between baseline and evoked firing rates < 0.05), and redundancy (proportion selective)
+* Fixed effects: treatment, stimulus species 
+* Possible fixed OR random effects: age, days since fledging, mass, hemisphere, unit type/brain region
+* Possible random effects: Bird ID, clutch ID, Unit ID
+
+# Read in the necessary files: XfosteringUnitSummary_Sheet1.csv (aka 'summary' below),frates_wide2.csv, firezals_sum.csv, stimframe.csv, StimulusDurationsCh2.csv (aka 'stimIDs' below),dprime.csv ,dprime_species.csv ,dprime_wn.csv, fullsummary_CDFG.csv (aka 'clutchcdfg' below)
+
+```{r Create necessary dfs (code also in XfosteringCh2.R script),results='hide',warning=FALSE}
+#create frates_wide2, summary, stimframe, and stimIDs dfs
+### CREATE STIM SET COLUMNS ###
+stimlist<-unlist(list.files("/Users/username/Documents/Dissertation/Finch X-fostering (Ch. 2)/Key files/", pattern=NULL, all.files=TRUE,full.names=FALSE),use.names = FALSE)
+stimlist2<-as.data.frame(stimlist)
+stimlist3<-stimlist2[-c(1:2),,drop=F]
+stimframe<-separate(stimlist3, stimlist, c("ID","Region","Trial","StimSet")) #ignore the warning message
+stimIDs<-read.csv("/Users/username/Documents/Dissertation/Finch X-fostering (Ch. 2)/StimulusDurationsCh2.csv", header=TRUE)
+
+##SUMMARY METADATA##
+summary<-read.csv("/Users/username/Documents/Dissertation/Finch X-fostering (Ch. 2)/XfosteringUnitSummary_Sheet1.csv", header=TRUE)
+summary<-summary[,-c(23:30)] #remove last 8 columns, which are all blank (not sure why R adds these...)
+
+#READ IN FRATES_WIDE2 
+frates_wide2<-read.csv("/Users/username/Documents/Dissertation/Finch X-fostering (Ch. 2)/frates_wide2.csv",header=T)
+
+##READ IN FIREZALS_SUM
+firezals_sum<-read.csv("/Users/username/Documents/Dissertation/Finch X-fostering (Ch. 2)/firezals_sum.csv",header=T)
+
+
+##FILL IN UNIT TYPE COLUMN## 
+#if only broad, NS1, and NS2 (for stats)
+firezals_sum$Type0<-with(firezals_sum, ifelse(Region == "NCM" & Peak.to.Peak_s > 0.0004, "Broad",
+                ifelse(Region == "NCM" & Peak.to.Peak_s < 0.0004 & Peak2PeakRatio < 0.355, "NS1",
+            ifelse(Region == "NCM" & Peak.to.Peak_s < 0.0004 & Peak2PeakRatio > 0.355, "NS2","Field L"))))
+firezals_sum$TypeBN<-with(firezals_sum, ifelse(Region == "NCM" & Peak.to.Peak_s > 0.0004, "Broad",
+               ifelse(Region == "NCM" & Peak.to.Peak_s < 0.0004, "Narrow","Field L")))
+#Field L unit types
+firezals_sum$TypeFL<-with(firezals_sum,ifelse(Region == "FL" & Peak.to.Peak_s > 0.0004, "Broad",
+                                              ifelse(Region == "FL" & Peak.to.Peak_s < 0.0004,"Narrow","NCM")))
+
+#Combine FamUnfam and Species columns
+firezals_sum<-unite(firezals_sum,FamUnfamSpecies,FamUnfam,Species, sep = "_",remove=FALSE)
+#remove BEFI units
+firezals_sum_zebi<-subset(firezals_sum,Treatment!="BEFI")
+#remove FosterFather stimulus
+firezals_sum_zebi<-subset(firezals_sum_zebi,FamUnfam!="FosterFather")
+#Make "normal" treatment the reference level
+firezals_sum_zebi$Treatment<-relevel(as.factor(firezals_sum_zebi$Treatment),ref=2)
+#Make "Field L" the reference level unit type
+firezals_sum_zebi$Type0<-relevel(as.factor(firezals_sum_zebi$Type0),ref=2)
+#Make "ZEBI" the reference level species
+firezals_sum_zebi$Species<-relevel(as.factor(firezals_sum_zebi$Species),ref=3)
+#Separate data frames for Field L and NCM
+firezals_sum_zebiNCM<-subset(firezals_sum_zebi,Region=="NCM")
+firezals_sum_zebiFL<-subset(firezals_sum_zebi,Region=="FL")
+```
+
+---
+
+# BASELINE FIRING RATE
+
+We will model firing rate like count data. The model will be based on all repeated measures of the same unit before each individual presentation of all stimuli (i.e. 5 stimuli x ~15 presentations per unit, but varies across units).
+
+### Manipulate the data frame
+```{r Manipulate df base_fr,results='hide',warning = FALSE}
+#use frates_wide2, summary, stimframe, and stimIDs dfs
+#combine all dfs to include treatment,stimID, and waveform info
+frates_wide3<-merge(frates_wide2,summary,by.x=c("ID","Region","Trialx","Letter"),by.y=c("ID","Region","Trial","Letter"),all.x = TRUE)
+stimframe$Trialx<-gsub("[a-zA-Z]","",stimframe$Trial)
+frates_wide4<-merge(frates_wide3,stimframe,by=c("ID","Region","Trialx"),all.x = TRUE)
+frates_wide4$Stimulus<-gsub("[?]","",frates_wide4$Stimulus)
+frates_wide5<-merge(frates_wide4,stimIDs,by.x=c("StimSet","Stimulus"),by.y=c("StimSet","StimNumber"),all.x = TRUE)
+#fill in unit type 
+frates_wide5$Peak2PeakRatio<-abs(as.numeric(frates_wide5$Trough_V)/frates_wide5$Peak_V)
+frates_wide5$Peak.to.Peak_s<-as.numeric(frates_wide5$Peak.to.Peak_s)
+frates_wide5$Type0<-with(frates_wide5, 
+                      ifelse(Region == "NCM" & Peak.to.Peak_s > 0.0004, "Broad",
+                      ifelse(Region == "NCM" & Peak.to.Peak_s < 0.0004 & Peak2PeakRatio < 0.355, "NS1",
+                      ifelse(Region == "NCM" & Peak.to.Peak_s < 0.0004 & Peak2PeakRatio > 0.355, "NS2","Field L"))))
+frates_wide5$TypeFL<-with(frates_wide5,ifelse(Region == "FL" & Peak.to.Peak_s > 0.0004, "Broad",
+                                              ifelse(Region == "FL" & Peak.to.Peak_s < 0.0004,"Narrow","NCM")))
+#remove BEFI units
+frates_wide5<-subset(frates_wide5,Treatment.y!="BEFI")
+#remove FosterFather stimulus
+frates_wide5<-subset(frates_wide5,FamUnfam!="FosterFather")
+#Make "normal" treatment the reference level
+frates_wide5$Treatment.y<-relevel(as.factor(frates_wide5$Treatment.y),ref=2)
+#Make "Field L" the reference level unit type
+frates_wide5$Type0<-relevel(as.factor(frates_wide5$Type0),ref=2)
+#Separate brain regions
+frates_wide5_FL<-subset(frates_wide5,Region=="FL")
+frates_wide5_NCM<-subset(frates_wide5,Region=="NCM")
+```
+
+Distributions to test: poisson, negative bionomial 1, negative binomial 2
+
+Possible predictor variables: Treatment, Type0, Mass, Hemisphere
+
+## Field L
+### Create models to test distributions and inclusion of predictors:
+```{r Create and compare models base_fr FL,eval = FALSE}
+basep1<-glmmTMB(base_fr~Treatment.y+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x),data=frates_wide5_FL,family="poisson")
+basenb11<-glmmTMB(base_fr~Treatment.y+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x),data=frates_wide5_FL,family="nbinom1") #does not converge
+basenb21<-glmmTMB(base_fr~Treatment.y+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x),data=frates_wide5_FL,family="nbinom2")
+AICtab(basep1,basenb11,basenb21) #NB2 model is best fit
+
+basenb21x<-glmmTMB(base_fr~Treatment.y+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere),data=frates_wide5_FL,family="nbinom2")
+basenb21y<-glmmTMB(base_fr~Treatment.y+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere),data=frates_wide5_FL,family="nbinom2")
+basenb21a<-glmmTMB(base_fr~Treatment.y+TypeFL+Mass+(1|Unit2)+(1|Hemisphere),data=frates_wide5_FL,family="nbinom2")
+basenb21b<-glmmTMB(base_fr~Treatment.y+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),data=frates_wide5_FL,family="nbinom2")
+basenb21c<-glmmTMB(base_fr~Treatment.y+TypeFL+Mass+Hemisphere+(1|Unit2),data=frates_wide5_FL,family="nbinom2")
+AICtab(basenb21a,basenb21b,basenb21c,basenb21,basenb21x,basenb21y) #basenb21c is best fit
+```
+Random effects removed (because variance very low i.e. < 0.001): Clutch, DaysPostFledge, ID.x, Age
+
+basenb21c is best fit by > 2 AIC
+
+### Model diagnostics
+```{r Diagnostics base_fr FL}
+FLbasenb11c<-glmmTMB(base_fr~Treatment.y+TypeFL+Mass+Hemisphere+(1|Unit2),data=frates_wide5_FL,family="nbinom2")
+
+simres <- simulateResiduals(FLbasenb11c)
+plot(simres) #KS test deviation significant (but likely due to Type I error because of large sample size), others are fine.
+#plotResiduals(simres, form = frates_wide5$Hemisphere)
+#plotResiduals(simres, form = frates_wide5$Treatment.y)
+#plotResiduals(simres, form = frates_wide5$Type0)
+testDispersion(simres) #no overdispersion or underdispersion
+testZeroInflation(simres) #no zero inflation
+testOutliers(simres,type='bootstrap') #outliers ARE significant
+```
+
+After bootstrapping there are too many outliers, but this is barely the case and there is no experimental reason to remove them. The KS test is significant, but this is likely to be Type I error because there are ~10000 data points. Move forward with basenb11c model.
+
+### Final model inference, means, and post hoc tests
+```{r Final model and results base_fr FL}
+summary(FLbasenb11c)
+exp(0.1230) #effect of mass
+exp(-0.2648) #effect of hemisphere
+emmeans(FLbasenb11c,pairwise~Treatment.y)
+emmeans(FLbasenb11c,pairwise~Treatment.y,type="response")
+```
+
+
+```{r Final model and results base_fr raw means FL, eval=FALSE,include=FALSE}
+#means for treatments
+f2 <- function(x) c(mean = mean(x), sd = sd(x), N = {NROW(x)})
+basetreatFL<-do.call(data.frame,aggregate(base_fr ~ Treatment.y, data = frates_wide5_FL, f2))
+basetreatFL$se<-basetreatFL$base_fr.sd/sqrt(basetreatFL$base_fr.N)
+basetreatFL
+```
+
+## NCM
+### Create models to test distributions and inclusion of predictors:
+```{r Create and compare models base_fr NCM,eval = FALSE}
+basep1<-glmmTMB(base_fr~Treatment.y+Type0+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x),data=frates_wide5_NCM,family="poisson")
+basenb11<-glmmTMB(base_fr~Treatment.y+Type0+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x),data=frates_wide5_NCM,family="nbinom1")
+basenb21<-glmmTMB(base_fr~Treatment.y+Type0(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x),data=frates_wide5_NCM,family="nbinom2")
+AICtab(basep1,basenb11,basenb21) #NB1 model is best fit
+
+basenb11x<-glmmTMB(base_fr~Treatment.y+Type0+(1|Unit2)+(1|Age)+(1|Mass)+(1|Hemisphere),data=frates_wide5_NCM,family="nbinom1")
+basenb11y<-glmmTMB(base_fr~Treatment.y+Type0+(1|Unit2)+(1|Age)+(1|Mass)+(1|Hemisphere),data=frates_wide5_NCM,family="nbinom1")
+basenb11a<-glmmTMB(base_fr~Treatment.y+Type0+Mass+(1|Unit2)+(1|Age)+(1|Hemisphere),data=frates_wide5_NCM,family="nbinom1")
+basenb11b<-glmmTMB(base_fr~Treatment.y+Type0+Hemisphere+(1|Unit2)+(1|Age)+(1|Mass),data=frates_wide5_NCM,family="nbinom1")
+basenb11c<-glmmTMB(base_fr~Treatment.y+Type0+Mass+Hemisphere+(1|Unit2)+(1|Age),data=frates_wide5_NCM,family="nbinom1")
+AICtab(basenb11a,basenb11b,basenb11c,basenb11,basenb11x,basenb11y) #basenb11c is best fit
+```
+Random effects removed (because variance very low i.e. < 0.001): Clutch, DaysPostFledge, ID.x
+
+basenb11b and basenb11c are not >2AIC apart. basenb11b is better with diagnostics and AIC.
+
+### Model diagnostics
+```{r Diagnostics base_fr NCM}
+NCMbasenb11b<-glmmTMB(base_fr~Treatment.y+Type0+Hemisphere+(1|Unit2)+(1|Age)+(1|Mass),data=frates_wide5_NCM,family="nbinom1")
+simres <- simulateResiduals(NCMbasenb11b)
+plot(simres) #KS test deviation significant (but likely due to Type I error because of large sample size), others are fine.
+#plotResiduals(simres, form = frates_wide5$Hemisphere)
+#plotResiduals(simres, form = frates_wide5$Treatment.y)
+#plotResiduals(simres, form = frates_wide5$Type0)
+testDispersion(simres) #no overdispersion or underdispersion
+testZeroInflation(simres) #no zero inflation
+testOutliers(simres,type='bootstrap') #outliers not significant
+```
+
+After bootstrapping there are no longer too many outliers. The KS test is significant, but this is likely to be Type I error because there are ~10000 data points. Move forward with basenb11c model.
+
+### Final model inference, means, and post hoc tests
+```{r Final model and results base_fr NCM}
+summary(NCMbasenb11b)
+exp(-0.25119) #effect of hemisphere
+emmeans(NCMbasenb11b,pairwise~Treatment.y)
+emmeans(NCMbasenb11b,pairwise~Treatment.y,type="response")
+emmeans(NCMbasenb11b,pairwise~Type0)
+emmeans(NCMbasenb11b,pairwise~Type0,type="response")
+```
+
+
+```{r Final model and results base_fr raw means NCM, eval=FALSE,include=FALSE}
+#means for treatments
+f2 <- function(x) c(mean = mean(x), sd = sd(x), N = {NROW(x)})
+basetreatNCM<-do.call(data.frame,aggregate(base_fr ~ Treatment.y, data = frates_wide5_NCM, f2))
+basetreatNCM$se<-basetreatNCM$base_fr.sd/sqrt(basetreatNCM$base_fr.N)
+basetreatNCM
+#means for unit types
+basetype0NCM<-do.call(data.frame,aggregate(base_fr ~ Type0, data = frates_wide5_NCM, f2))
+basetype0NCM$se<-basetype0NCM$base_fr.sd/sqrt(basetype0NCM$base_fr.N)
+basetype0NCM
+```
+
+---
+
+# STIMULUS-EVOKED FIRING RATE
+
+We will model these data like counts and use an offset term in the models to account for differences in duration of each stimulus.
+
+```{r data frame manipulation stim_fr}
+#use frates_wide5 df
+#stim_fr column is currently spikes/sec (i.e. a rate)
+#Back-calculate the raw count by multiplying by the duration of each stimulus
+frates_wide5$stim_fr_count<-frates_wide5$stim_fr*frates_wide5$Duration.s
+#Combine Species and FamUnfam columns?
+frates_wide5<-unite(frates_wide5,FamUnfamSpecies,FamUnfam,Species, sep = "_",remove=FALSE)
+#Separate brain regions
+frates_wide5_FL<-subset(frates_wide5,Region=="FL")
+frates_wide5_NCM<-subset(frates_wide5,Region=="NCM")
+```
+
+## Field L
+### Testing for the best distribution:
+```{r test distribution stim_fr FL,eval=FALSE}
+#stimp<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_FL,family="poisson") #does not converge
+stimnb1<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_FL,family="nbinom1")
+#stimnb2<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_FL,family="nbinom2") #does not converge
+#AICtab(stimnb1,stimnb2) 
+```
+
+Best distribution = negative binomial 1
+
+Random effects removed due to low variance (i.e. < 0.001): Age, Clutch, ID.x, Hemisphere, Mass (on the edge, but made no difference)
+
+### Testing addition of other predictors and zero inflation term
+```{r model composition stim_fr FL,eval=FALSE}
+stimnb10<-glmmTMB(stim_fr_count~Treatment.y+FamUnfamSpecies+TypeFL+(1|Unit2)+(1|DaysPostFledge)+offset(log(Duration.s)),data=frates_wide5_FL,family="nbinom1")
+stimnb11<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|DaysPostFledge)+offset(log(Duration.s)),data=frates_wide5_FL,family="nbinom1")
+stimnb13<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+TypeFL+DaysPostFledge+(1|Unit2)+offset(log(Duration.s)),data=frates_wide5_FL,family="nbinom1")
+stimnb14<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+offset(log(Duration.s)),data=frates_wide5_FL,family="nbinom1")
+#stimnb130<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+TypeFL+DaysPostFledge+(1|Unit2)+offset(log(Duration.s)),data=frates_wide5_FL,family="nbinom1")
+AICtab(stimnb1,stimnb10,stimnb11,stimnb13,stimnb14) 
+```
+Best model fit is stimnb13 (next model deltaAIC = 5.5)
+
+
+### Model diagnostics
+```{r diagnostics stim_fr FL,warning=FALSE}
+FLstimnb13<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+TypeFL+DaysPostFledge+(1|Unit2)+offset(log(Duration.s)),data=frates_wide5_FL,family="nbinom1")
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(FLstimnb13)
+plot(simres) #KS test significant
+#plotResiduals(simres, form = frates_wide5$Treatment.y)
+testDispersion(simres) #no overdispersion or underdispersion
+testZeroInflation(simres) #no zero inflation
+testOutliers(simres,type='bootstrap') # number of outliers not significant
+```
+
+KS test significant, but no other test show an issue after using bootstrapping to get a more exact result. Uniformity is likely off because of Type I error and this large number of samples, so I will move forward with the stimnb13 model.
+
+Note: If a model is fitted and its formula includes an offset() term, then by default, the offset is computed and included in the reference grid for calculation of emmeans.
+
+### Model inference, means, and post hoc tests
+```{r inference stim_fr FL}
+summary(FLstimnb13)
+exp( 0.15004) #effect of days post fledge
+exp(0.45166) #effect of unit type
+emmeans(FLstimnb13,pairwise~"FamUnfamSpecies","Treatment.y")
+emmeans(FLstimnb13,pairwise~"FamUnfamSpecies","Treatment.y",type="response")
+emmeans(FLstimnb13,pairwise~Treatment.y)
+emmeans(FLstimnb13,pairwise~Treatment.y,type="response")
+```
+
+```{r inference stim_fr raw means FL,eval=FALSE,include=FALSE}
+#means for treatments
+stimtreatFL<-do.call(data.frame,aggregate(stim_fr ~ Treatment.y, data = frates_wide5_FL, f2))
+stimtreatFL$se<-stimtreatFL$stim_fr.sd/sqrt(stimtreatFL$stim_fr.N)
+stimtreatFL
+```
+
+## NCM
+### Testing for the best distribution:
+```{r test distribution stim_fr NCM,eval=FALSE}
+stimp<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="poisson")
+#stimnb1<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1") #does not converge
+stimnb1a<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|Clutch)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1") 
+stimnb2<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|DaysPostFledge)+(1|Age)+(1|Clutch)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom2") 
+AICtab(stimp,stimnb1a,stimnb2) 
+```
+
+Best distribution = negative binomial 1 (but only after removing unnecessary random effects)
+
+Random effects removed due to low variance (i.e. < 0.001): Age, DaysPostFledge, Hemisphere, Clutch, probably also Mass
+
+### Testing addition of other predictors and zero inflation term
+```{r model composition stim_fr NCM,eval=FALSE}
+stimnb10<-glmmTMB(stim_fr_count~Treatment.y+FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1")
+stimnb11<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1")
+stimnb12<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+Mass+(1|Unit2)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1")
+stimnb13<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+DaysPostFledge+(1|Unit2)+(1|Mass)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1")
+stimnb14<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|Mass)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1")
+stimnb15<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+(1|Unit2)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1")
+AICtab(stimnb1,stimnb10,stimnb11,stimnb12,stimnb13,stimnb14,stimnb15) 
+```
+stimnb15 and stimnb12 are within 2 deltaAIC, but 15 is slightly lower and has less df, so I will go with that model.
+
+
+### Model diagnostics
+```{r diagnostics stim_fr NCM,warning=FALSE}
+NCMstimnb15<-glmmTMB(stim_fr_count~Treatment.y*FamUnfamSpecies+Type0+(1|Unit2)+(1|ID.x)+offset(log(Duration.s)),data=frates_wide5_NCM,family="nbinom1")
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(NCMstimnb15)
+plot(simres) #KS test significant
+#plotResiduals(simres, form = frates_wide5$Treatment.y)
+testDispersion(simres) #no overdispersion or underdispersion
+testZeroInflation(simres) #no zero inflation
+testOutliers(simres,type='bootstrap') # number of outliers not significant
+```
+
+KS test significant, but no other test show an issue after using bootstrapping to get a more exact result. Uniformity is likely off because of Type I error and this large number of samples, so I will move forward with the stimnb15 model.
+
+Note: If a model is fitted and its formula includes an offset() term, then by default, the offset is computed and included in the reference grid for calculation of emmeans.
+
+### Model inference, means, and post hoc tests
+```{r inference stim_fr NCM}
+summary(NCMstimnb15)
+emmeans(NCMstimnb15,pairwise~"FamUnfamSpecies","Treatment.y")
+emmeans(NCMstimnb15,pairwise~"FamUnfamSpecies","Treatment.y",type="response")
+emmeans(NCMstimnb15,pairwise~Treatment.y)
+emmeans(NCMstimnb15,pairwise~Treatment.y,type="response")
+emmeans(NCMstimnb15,pairwise~Type0)
+emmeans(NCMstimnb15,pairwise~Type0,type="response")
+```
+
+```{r inference stim_fr raw means NCM,eval=FALSE,include=FALSE}
+#means for treatments
+stimtreatNCM<-do.call(data.frame,aggregate(stim_fr ~ Treatment.y, data = frates_wide5_NCM, f2))
+stimtreatNCM$se<-stimtreatNCM$stim_fr.sd/sqrt(stimtreatNCM$stim_fr.N)
+stimtreatNCM
+#means for unit types
+stimtype0NCM<-do.call(data.frame,aggregate(stim_fr ~ Type0, data = frates_wide5_NCM, f2))
+stimtype0NCM$se<-stimtype0NCM$stim_fr.sd/sqrt(stimtype0NCM$stim_fr.N)
+stimtype0NCM
+```
+
+---
+
+# LATENCY
+
+This data is all non-negative, positive integers and is right-skewed. There is one average latency per unit-stimulus combination. Units that did not cross the baseline firing rate in a 5ms bin within the first 400ms after stimulus onset were not included in this analysis.
+
+```{r Histogram latency}
+#use firezals_sum_zebi dataframe
+hist(firezals_sum_zebi$Latency)
+```
+
+
+## Field L
+### Check for best distribution for this data
+```{r Check for best distribution latency FL,eval=FALSE}
+lat<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiFL)
+latlog<-glmmTMB(log(Latency)~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiFL)
+latgamma<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),family=Gamma(link = log),data=firezals_sum_zebiFL)
+AICtab(lat,latlog,latgamma)
+```
+
+Gamma distribution fits this data best by far. 
+Random effects removed due to low variance: days post fledge, age, clutch, bird ID, hemisphere
+
+### Model diagnostics
+```{r diagnostics latency FL}
+latgamma0FL<-glmmTMB(Latency~Treatment*FamUnfamSpecies+(1|Unit2),family=Gamma(link = log),data=firezals_sum_zebiFL)
+latgammaFL<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass),family=Gamma(link = log),data=firezals_sum_zebiFL)
+latgamma2FL<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+Mass+(1|Unit2),family=Gamma(link = log),data=firezals_sum_zebiFL)
+AICtab(latgamma0FL,latgammaFL,latgamma2FL)
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(latgammaFL)
+plot(simres) #KS test is significant and quartile deviations bad, although the plots don't look too bad
+testDispersion(simres) #no dispersion issue
+testZeroInflation(simres) #no zero inflation
+testOutliers(simres,type='bootstrap') # number of outliers is significant
+```
+
+Let's see if we can improve the diagnostics by adding a dispersion factor.
+
+```{r Improving the model latency FL,eval=FALSE}
+latgamma<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass),family=Gamma(link = log),data=firezals_sum_zebiFL)
+latgammadisp<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass),dispformula = ~1,family=Gamma(link = log),data=firezals_sum_zebiFL)
+latgammadisp2<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass),dispformula = ~Treatment*FamUnfamSpecies,family=Gamma(link = log),data=firezals_sum_zebiFL)
+latgammadisp3<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass),dispformula = ~Treatment+FamUnfamSpecies,family=Gamma(link = log),data=firezals_sum_zebiFL)
+
+AICtab(latgamma,latgammadisp,latgammadisp2,latgammadisp3)#,latgammadisp4,latgammadisp5)
+```
+
+The dispersion factor does improve the fit of the model, but does it improve the diagnostics and adherence to model assumptions?
+
+```{r diagnostics again latency FL}
+latgammadisp2FL<-glmmTMB(Latency~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass),dispformula = ~Treatment*FamUnfamSpecies,family=Gamma(link = log),data=firezals_sum_zebiFL)
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(latgammadisp2FL)
+plot(simres) 
+testOutliers(simres,type='bootstrap') # outliers no longer a significant problem
+```
+
+Looks much better!
+
+### Model Inference and Post Hoc Tests
+```{r Intference latency FL}
+summary(latgammadisp2FL)
+emmeans(latgammadisp2FL,pairwise~Treatment)
+emmeans(latgammadisp2FL,pairwise~Treatment,type="response")
+emmeans(latgammadisp2FL,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(latgammadisp2FL,pairwise~"FamUnfamSpecies","Treatment",type="response")
+emmeans(latgammadisp2FL,pairwise~"Treatment","FamUnfamSpecies")
+```
+
+## NCM
+### Check for best distribution for this data
+```{r Check for best distribution latency NCM,eval=FALSE}
+lat<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiNCM) #does not converge
+latlog<-glmmTMB(log(Latency)~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiNCM)
+latgamma<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),family=Gamma(link = log),data=firezals_sum_zebiNCM)
+latgamma2<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2),family=Gamma(link = log),data=firezals_sum_zebiNCM)
+AICtab(lat,latlog,latgamma,latgamma2)
+```
+
+Random effects removed due to low variance: all except for Unit ID
+Gamma distribution fits this data best by far. Let's look check out the diagnostics.
+
+### Model diagnostics
+```{r diagnostics latency NCM}
+latgamma2<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2),family=Gamma(link = log),data=firezals_sum_zebiNCM)
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(latgamma2)
+plot(simres) #all tests significant, although the plots don't look too bad
+testDispersion(simres) #some minor dispersion issues, but does not look bad
+testZeroInflation(simres) #no zero inflation
+testOutliers(simres,type='bootstrap') # number of outliers is significant
+```
+
+Let's see if we can improve the diagnostics by adding a dispersion factor and removing outliers.
+
+```{r Improving the model latency NCM,eval=FALSE}
+latgamma2<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2),family=Gamma(link = log),data=firezals_sum_zebiNCM)
+latgammadisp<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2),dispformula = ~1,family=Gamma(link = log),data=firezals_sum_zebiNCM)
+latgammadisp2<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2),dispformula = ~Treatment*FamUnfamSpecies+Type0,family=Gamma(link = log),data=firezals_sum_zebiNCM)
+latgammadisp3<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2),dispformula = ~Treatment+FamUnfamSpecies+Type0,family=Gamma(link = log),data=firezals_sum_zebiNCM)
+latgammadisp4<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2),dispformula = ~Treatment*FamUnfamSpecies,family=Gamma(link = log),data=firezals_sum_zebiNCM)
+
+AICtab(latgamma2,latgammadisp,latgammadisp2,latgammadisp3,latgammadisp4)
+```
+
+
+latgammadisp3 is top model by >2 deltaAIC. The dispersion factor improved the fit of the model! Does it improve the diagnostics and adherence to model assumptions?
+
+```{r diagnostics again latency NCM}
+latgammadisp3NCM<-glmmTMB(Latency~Treatment*FamUnfamSpecies+Type0+(1|Unit2),dispformula = ~Treatment+FamUnfamSpecies+Type0,family=Gamma(link = log),data=firezals_sum_zebiNCM)
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(latgammadisp3NCM)
+plot(simres) 
+testDispersion(simres) #some minor dispersion issues, but does not look bad
+testZeroInflation(simres) #no zero inflation
+testOutliers(simres,type='bootstrap') #still marginal outlier issue, but p = 0.06
+```
+
+All looks very good!
+
+### Model Inference and Post Hoc Tests
+```{r Intference latency NCM}
+summary(latgammadisp3NCM)
+emmeans(latgammadisp3NCM,pairwise~Treatment)
+emmeans(latgammadisp3NCM,pairwise~Treatment,type="response")
+emmeans(latgammadisp3NCM,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(latgammadisp3NCM,pairwise~"FamUnfamSpecies","Treatment",type="response")
+emmeans(latgammadisp3NCM,pairwise~"Treatment","FamUnfamSpecies")
+emmeans(latgammadisp3NCM,pairwise~Type0)
+emmeans(latgammadisp3NCM,pairwise~Type0,type="response")
+```
+
+---
+
+# Z-SCORE
+
+These data are continuous and can be positive or negative. They look relatively normal with a small tail to the right, so there could be some outliers. The best distribution to model residuals from these might be gaussian, but let's verify that.
+
+```{r df manipulations and histogram Zscore}
+#use firezals_sum_zebiFL and firezals_sum_zebiNCM dfs
+#Remove the 1 NA Z-score row
+firezals_sum_zebiNCM_noNAs<-subset(firezals_sum_zebiNCM,Z_score!="NA")
+#histograms
+hist(firezals_sum_zebiFL$Z_score)
+hist(firezals_sum_zebiNCM_noNAs$Z_score)
+```
+
+## Field L
+### Model Creation
+```{r Create models Zscore FL,eval=FALSE}
+z0<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiFL)
+summary(z0)
+```
+
+Random effects removed due to low variance: ID.x (bird ID), clutch, age, days post fledge
+
+```{r Create models 2 Zscore FL,eval=FALSE}
+z<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere),data=firezals_sum_zebiFL)
+z1<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+TypeFL+Mass+(1|Unit2)+(1|Hemisphere),data=firezals_sum_zebiFL)
+z2<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),data=firezals_sum_zebiFL)
+z3<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+TypeFL+Mass+Hemisphere+(1|Unit2),data=firezals_sum_zebiFL)
+AICtab(z,z1,z2,z3)
+```
+
+Model fit is best with Mass as a random effect instead of a fixed effect. Model z2 is the best by deltaAIC = 5.6.
+
+### Diagnostics
+```{r diagnostics Zscore FL}
+z2FL<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),data=firezals_sum_zebiFL)
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(z2FL)
+plot(simres)
+testDispersion(simres) #NS
+testOutliers(simres,type='bootstrap') # NS
+```
+
+The KS test shows deviation from uniformity and there are also some quantile deviations. The outlier test no longer significant after bootstrapping. Let's still try to remove outliers and see if this looks significantly better. 
+
+```{r More diagnostics Zscore FL}
+firezals_sum_zebiFL_outliersremoved<-cbind(firezals_sum_zebiFL,simres$scaledResiduals) #scaled residuals based on z2 model
+colnames(firezals_sum_zebiFL_outliersremoved)[49]<-'scaledResiduals'
+firezals_sum_zebiFL_outliersremoved<-subset(firezals_sum_zebiFL_outliersremoved,scaledResiduals>0 & scaledResiduals<1)
+z2FL_nooutliers<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),data=firezals_sum_zebiFL_outliersremoved)
+AICtab(z2FL,z2FL_nooutliers)
+simres2 <- simulateResiduals(z2FL_nooutliers)
+plot(simres2)
+```
+
+Diagnostics look a bit better and the fit is much better (based on AIC), so let's use the model without outliers.
+
+NOTE: THERE IS NO LINK SCALE FOR THIS MODEL, SO ESTIMATES ARE ALREADY ON THE RESPONSE SCALE.
+
+### Model Inference and Post Hoc Tests
+```{r inference Zscore FL}
+summary(z2FL_nooutliers)
+emmeans(z2FL_nooutliers,pairwise~"Treatment")
+emmeans(z2FL_nooutliers,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(z2FL_nooutliers,pairwise~"Treatment","FamUnfamSpecies")
+```
+
+
+```{r inference Zscore raw means FL, eval=FALSE,include=FALSE}
+#NOTE: DID NOT EDIT THIS CHUNK, SO IT WILL NOT RUN IF YOU CHANGE TO EVAL=TRUE
+#means for treatments
+ztreat<-do.call(data.frame,aggregate(Z_score ~ Treatment, data = firezals_sum_zebi_noNAs, f2))
+ztreat$se<-ztreat$Z_score.sd/sqrt(ztreat$Z_score.N)
+ztreat
+#means for unit types
+ztype0<-do.call(data.frame,aggregate(Z_score ~ Type0, data = firezals_sum_zebi_noNAs, f2))
+ztype0$se<-ztype0$Z_score.sd/sqrt(ztype0$Z_score.N)
+ztype0
+
+z.emm<-emmeans(z8_nooutliers, ~ Treatment * FamUnfamSpecies * TypeBN)
+contrast(z.emm, "consec", simple = "each", combine = TRUE)
+pairs(z.emm, simple = "FamUnfamSpecies", combine = FALSE )
+```
+
+## NCM
+### Model Creation
+```{r Create models Zscore NCM, eval=FALSE}
+z0<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiNCM)
+z<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiNCM)
+z00<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Hemisphere)+(1|ID.x),data=firezals_sum_zebiNCM)
+AICtab(z,z0,z00)
+summary(z)
+```
+
+Random effects removed due to low variance: Mass, age, days post fledge, clutch
+
+
+```{r Create models 2 Zscore NCM,eval=FALSE}
+z00<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Hemisphere)+(1|ID.x),data=firezals_sum_zebiNCM)
+z1<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|ID.x),data=firezals_sum_zebiNCM)
+z2<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|ID.x),data=firezals_sum_zebiNCM)
+AICtab(z,z1,z2)
+```
+
+Model fit is improved with hemisphere as a fixed effect. Model z1 is the best fit by 7.6 deltaAIC.
+
+### Diagnostics
+```{r diagnostics Zscore NCM}
+z1NCM<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|ID.x),data=firezals_sum_zebiNCM)
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(z1NCM)
+plot(simres)
+testOutliers(simres,type='bootstrap') # NS
+```
+
+The KS test shows significant deviation from uniformity and there are also some quantile deviations. The outlier test is no longer significant after bootstrapping, but may still be an issue. Let's try to remove them and see if this looks significantly better. 
+
+```{r More diagnostics Zscore NCM}
+firezals_sum_zebiNCM_outliersremoved<-cbind(firezals_sum_zebiNCM_noNAs,simres$scaledResiduals) #scaled residuals based on z1 model
+colnames(firezals_sum_zebiNCM_outliersremoved)[49]<-'scaledResiduals'
+firezals_sum_zebiNCM_outliersremoved<-subset(firezals_sum_zebiNCM_outliersremoved,scaledResiduals>0 & scaledResiduals<1)
+z1NCM_nooutliers<-glmmTMB(Z_score~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|ID.x),data=firezals_sum_zebiNCM_outliersremoved)
+AICtab(z1NCM,z1NCM_nooutliers)
+simres2 <- simulateResiduals(z1NCM_nooutliers)
+plot(simres2)
+```
+
+Diagnostics look a bit better and the fit is much better (based on AIC), so let's use the model without outliers.
+
+NOTE: THERE IS NO LINK SCALE FOR THIS MODEL, SO ESTIMATES ARE ALREADY ON THE RESPONSE SCALE.
+
+### Model Inference and Post Hoc Tests
+```{r inference Zscore NCM}
+summary(z1NCM_nooutliers)
+emmeans(z1NCM_nooutliers,pairwise~"Treatment")
+emmeans(z1NCM_nooutliers,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(z1NCM_nooutliers,pairwise~"Treatment","FamUnfamSpecies")
+emmeans(z1NCM_nooutliers,pairwise~"Type0")
+```
+
+
+```{r inference Zscore raw means NCM, eval=FALSE,include=FALSE}
+#DID NOT EDIT THIS CHUNK SO IT WILL NOT RUN IF CHANGED TO EVAL=TRUE
+#means for treatments
+ztreat<-do.call(data.frame,aggregate(Z_score ~ Treatment, data = firezals_sum_zebi_noNAs, f2))
+ztreat$se<-ztreat$Z_score.sd/sqrt(ztreat$Z_score.N)
+ztreat
+#means for unit types
+ztype0<-do.call(data.frame,aggregate(Z_score ~ Type0, data = firezals_sum_zebi_noNAs, f2))
+ztype0$se<-ztype0$Z_score.sd/sqrt(ztype0$Z_score.N)
+ztype0
+
+z.emm<-emmeans(z8_nooutliers, ~ Treatment * FamUnfamSpecies * TypeBN)
+contrast(z.emm, "consec", simple = "each", combine = TRUE)
+pairs(z.emm, simple = "FamUnfamSpecies", combine = FALSE )
+```
+
+---
+
+# D PRIME
+
+The data is continuous, but can be negative. Looks like a fairly symmetrical bell curve with only a small number of very large value outliers.
+
+```{r df manipulation d}
+#NOTE: 5 units cannot be analyzed here because they did not hear white noise (units from C4 trials 4 and 5)
+#use the dprime_zebi df
+dprime<-read.csv("/Users/username/Documents/Dissertation/Finch X-fostering (Ch. 2)/dprime.csv", header=TRUE)
+#remove befi units
+dprime_zebi<-subset(dprime,Treatment!="BEFI")
+#remove FosterFather stimulus
+dprime_zebi<-subset(dprime_zebi,FamUnfamSpecies!="FosterFather_BEFI")
+#Make "normal" treatment the reference level
+dprime_zebi$Treatment<-relevel(as.factor(dprime_zebi$Treatment),ref=2)
+#Make "Field L" the reference level unit type
+dprime_zebi$Type0<-relevel(as.factor(dprime_zebi$Type0),ref=2)
+#Create separate dataframes for Field L and NCM
+dprime_zebi_FL<-subset(dprime_zebi,Region=="FL")
+dprime_zebi_NCM<-subset(dprime_zebi,Region=="NCM")
+
+#quick plot to view data
+hist(dprime$dprime)
+```
+
+### CDF analysis (white noise as comparison)
+```{r CDF dprime against white noise}
+#cdf plot
+ggplot(dprime_zebi, aes(x=dprime, group =Treatment,color=Treatment)) + stat_ecdf()+facet_wrap(~Region~FamUnfamSpecies)
+
+#levene.dat.aov<-aov(dprime~Treatment*(FamUnfamSpecies+Region),dprime_zebi)
+levene.dat.aov<-aov(dprime~Treatment*FamUnfamSpecies*Region,dprime_zebi)
+summary(levene.dat.aov)
+TukeyHSD(levene.dat.aov)
+```
+
+
+### CDF analysis (BEFI as comparison for ZEBI stimuli--THIS IS ONLY THE CASE FOR THIS SECTION)
+```{r CDF dprime befi against zebi}
+#read in data frame
+dprime_species<-read.csv("/Users/username/Documents/Dissertation/Finch X-fostering (Ch. 2)/dprime_species.csv", header=TRUE)
+#remove befi units
+dprime_species2<-subset(dprime_species,Treatment!="BEFI")
+#cdf plot
+ggplot(data=dprime_species2,aes(x=dprime,color=Treatment))+facet_wrap(~Region)+geom_density()
+ggplot(dprime_species2, aes(x=dprime,group=Treatment,color=Treatment))+stat_ecdf()+facet_wrap(~Region)
+#boxplot
+ggplot(dprime_species2,aes(x=Treatment,y=dprime))+facet_wrap(~Region)+geom_boxplot()+geom_jitter(alpha=0.6)+ stat_summary(fun=mean,geom="point",color="black",shape=18,size=5)
+  
+levene.species.aov<-aov(dprime~Treatment*Region,dprime_species2)
+summary(levene.species.aov)
+TukeyHSD(levene.species.aov)
+```
+
+Units in cross-fostered birds are significantly different from isolate and normal units. On a unit-level, selectivity is shifted toward preference for BEFI songs.
+
+## Field L
+### Model Creation (white noise as the comparison)
+```{r create models d FL,eval=FALSE}
+d0<-glmmTMB(dprime~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=dprime_zebi_FL)
+summary(d0)
+```
+
+Random effects removed due to low variance: bird ID, age, days post fledge
+
+```{r Compare models d 2 FL,eval=FALSE}
+d1<-glmmTMB(dprime~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|Clutch),data=dprime_zebi_FL)
+d2<-glmmTMB(dprime~Treatment+FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|Clutch),data=dprime_zebi_FL)
+d3<-glmmTMB(dprime~Treatment*FamUnfamSpecies+TypeFL+Mass+(1|Unit2)+(1|Hemisphere)+(1|Clutch),data=dprime_zebi_FL)
+d4<-glmmTMB(dprime~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass)+(1|Clutch),data=dprime_zebi_FL)
+d5<-glmmTMB(dprime~Treatment*FamUnfamSpecies+TypeFL+Mass+Hemisphere+(1|Unit2)+(1|Clutch),data=dprime_zebi_FL)
+AICtab(d1,d2,d3,d4,d5)
+```
+
+d4 is the best fit by 1.8 delta AIC over d5. 
+
+### Model diagnostics
+```{r diagnostics d FL,warning=FALSE}
+d4FL<-glmmTMB(dprime~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass)+(1|Clutch),data=dprime_zebi_FL)
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(d4FL)
+plot(simres) 
+testOutliers(simres,type='bootstrap')
+```
+
+There are some quantile deviations, but no dispersion or significant outlier issues after bootstrapping. It looks like there might be a large number of outliers even if it isn't statistically significant, so I will see if removing them improves the quantile deviations.
+
+```{r Removing outliers d prime FL}
+dprime_zebi_FL_outliersremoved<-cbind(dprime_zebi_FL,simres$scaledResiduals) #scaled residuals based on d4 model
+colnames(dprime_zebi_FL_outliersremoved)[54]<-'scaledResiduals'
+dprime_zebi_FL_outliersremoved<-subset(dprime_zebi_FL_outliersremoved,scaledResiduals>0 & scaledResiduals<1)
+d4FL_nooutliers<-glmmTMB(dprime~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass)+(1|Clutch),data=dprime_zebi_FL_outliersremoved) 
+
+AICtab(d4FL_nooutliers,d4FL)
+simres <- simulateResiduals(d4FL_nooutliers)
+plot(simres) 
+```
+Model fit is improved and diagnostics are sliiiightly improved after removing outliers.
+
+
+NOTE: THERE IS NO LINK SCALE FOR THIS MODEL, SO ESTIMATES ARE ALREADY ON THE RESPONSE SCALE.
+
+### Model Inference and Post Hoc Tests
+```{r Inference d FL}
+summary(d4FL_nooutliers)
+emmeans(d4FL_nooutliers,pairwise~Treatment)
+emmeans(d4FL_nooutliers,pairwise~"Treatment","FamUnfamSpecies")
+emmeans(d4FL_nooutliers,pairwise~"FamUnfamSpecies","Treatment")
+```
+
+## NCM
+### Model Creation (white noise as the comparison)
+```{r create models d NCM, eval=FALSE}
+d0<-glmmTMB(dprime~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=dprime_zebi_NCM)
+summary(d0)
+```
+
+Random effects removed due to low variance: clutch ID, age, days post fledge, mass
+
+```{r Compare models d 2 NCM,eval=FALSE}
+d1<-glmmTMB(dprime~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|ID.x)+(1|Hemisphere),data=dprime_zebi_NCM)
+d2<-glmmTMB(dprime~Treatment+FamUnfamSpecies+Type0+(1|Unit2)+(1|ID.x)+(1|Hemisphere),data=dprime_zebi_NCM)
+d3<-glmmTMB(dprime~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|ID.x),data=dprime_zebi_NCM)
+AICtab(d1,d2,d3)
+```
+
+d3 is the best fit by 4.2 delta AIC over d1. Let's check diagnostics.
+
+### Model diagnostics
+```{r diagnostics d NCM,warning=FALSE}
+d3NCM<-glmmTMB(dprime~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|ID.x),data=dprime_zebi_NCM)
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(d3NCM)
+plot(simres) 
+testOutliers(simres,type='bootstrap') 
+```
+
+
+KS test shows deviation form uniformity and there are some minor quantile deviations. After bootstrapping, there is no outlier issue. This looks acceptable.
+
+NOTE: THERE IS NO LINK SCALE FOR THIS MODEL, SO ESTIMATES ARE ALREADY ON THE RESPONSE SCALE.
+
+### Model Inference and Post Hoc Tests
+```{r Inference d NCM}
+summary(d3NCM)
+emmeans(d3NCM,pairwise~Treatment)
+emmeans(d3NCM,pairwise~"Treatment","FamUnfamSpecies")
+emmeans(d3NCM,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(d3NCM,pairwise~Type0)
+```
+
+---
+
+# D PRIME: PROPORTION SELECTIVE
+
+This response variable is the proportion of units selective for each stimulus type over white noise. 
+
+|d’WN| > 0.7 (i.e. ”selective”), as used by Mooney et al. 2001, PNAS. This is proportion data [0,1], so we will use the binomial distribution for our models.
+
+Interpreting binomial coefficients: https://data.library.virginia.edu/getting-started-with-binomial-generalized-linear-mixed-models/
+
+```{r manipulate data frame and view data. d prop, warning=FALSE}
+#find values over |0.7|. Success = 1, failure = 0
+dprime_zebi$dselective01<- with(dprime_zebi, ifelse(dprime > 0.7, 1, ifelse(dprime < -0.7, 1, 0)))
+#Create separate dataframes for Field L and NCM
+dprime_zebi_FL<-subset(dprime_zebi,Region=="FL")
+dprime_zebi_NCM<-subset(dprime_zebi,Region=="NCM")
+#quick plot to view data
+ggplot(dprime_zebi,aes(x=dselective01))+geom_histogram(stat="count")
+```
+
+Most units are selective for songs over white noise. Let's see how this is affected by treatment and the stimulus identity.
+
+
+## Field L
+### Model Creation
+```{r create models d prop FL,eval=FALSE}
+dprop0<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=dprime_zebi_FL,family=binomial)
+summary(dprop0)
+```
+
+Random effects removed: age, days post fledge
+
+
+```{r Create models 2 d prop FL,eval=FALSE}
+dprop<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere)+(1|ID.x)+(1|Clutch),data=dprime_zebi_FL,family=binomial) 
+dprop1<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+TypeFL+Mass+Hemisphere+(1|Unit2)+(1|ID.x)+(1|Clutch),data=dprime_zebi_FL,family=binomial) 
+dprop2<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+TypeFL+Mass+(1|Unit2)+(1|Hemisphere)+(1|ID.x)+(1|Clutch),data=dprime_zebi_FL,family=binomial) 
+dprop3<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|ID.x)+(1|Clutch),data=dprime_zebi_FL,family=binomial) 
+dprop3x<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|ID.x),data=dprime_zebi_FL,family=binomial) 
+AICtab(dprop,dprop1,dprop2,dprop3,dprop3x)
+```
+dprop3 is the best fit.
+
+### Model diagnostics
+```{r diagnostics comparison d prop FL}
+dprop3xFL<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|ID.x),data=dprime_zebi_FL,family=binomial) 
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(dprop3xFL)
+plot(simres) 
+```
+
+Looks great with no issues! 
+
+NOTE: The link scale for this model is logit. Original output will be on the log odds ratio scale. If converting to response scale, they will be in log odds.
+
+### Model Inference and Post Hoc Tests
+```{r inference d prop FL}
+summary(dprop3xFL)
+plogis(1.384) #effect of hemisphere
+plogis(0.574) #effect of unit type
+emmeans(dprop3xFL,pairwise~Treatment)
+emmeans(dprop3xFL,pairwise~Treatment,type="response")
+emmeans(dprop3xFL,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(dprop3xFL,pairwise~"FamUnfamSpecies","Treatment",type="response")
+emmeans(dprop3xFL,pairwise~"Treatment","FamUnfamSpecies")
+```
+
+## NCM
+### Model Creation
+```{r create models d prop NCM,eval=FALSE}
+dprop0<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass)+(1|DaysPostFledge)+(1|Age)+(1|Hemisphere)+(1|Clutch)+(1|ID.x),data=dprime_zebi_NCM,family=binomial)
+summary(dprop0)
+```
+
+Random effects removed: mass, Clutch, age, days post fledge
+
+
+```{r Create models 2 d prop NCM,eval=FALSE}
+dprop<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Hemisphere)+(1|ID.x),data=dprime_zebi_NCM,family=binomial) 
+dprop1<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|ID.x),data=dprime_zebi_NCM,family=binomial) 
+AICtab(dprop0,dprop,dprop1)
+```
+
+dprop1 is the best fit by 3 deltaAIC.
+
+### Model diagnostics
+```{r diagnostics d prop NCM}
+dprop1NCM<-glmmTMB(dselective01~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|ID.x),data=dprime_zebi_NCM,family=binomial) 
+
+#diagnostics check (Dharma package)
+simres1 <- simulateResiduals(dprop1NCM)
+plot(simres1) 
+```
+
+Diagnostics look great with no issues! 
+
+NOTE: The link scale for this model is logit. Original output will be on the log odds ratio scale. If converting to response scale, they will be in log odds.
+
+### Model Inference and Post Hoc Tests
+```{r inference d prop NCM}
+summary(dprop1NCM)
+plogis(0.6073) #effect of hemisphere, marginal P value
+emmeans(dprop1NCM,pairwise~Treatment)
+emmeans(dprop1NCM,pairwise~Treatment,type="response")
+emmeans(dprop1NCM,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(dprop1NCM,pairwise~"FamUnfamSpecies","Treatment",type="response")
+emmeans(dprop1NCM,pairwise~"Treatment","FamUnfamSpecies")
+emmeans(dprop1NCM,pairwise~Type0)
+emmeans(dprop1NCM,pairwise~Type0,type="response")
+```
+
+---
+
+# PROPORTION RESPONSIVE
+
+This is proportion data, so we will again model it with a binomial distribution.
+
+```{r manipulate and view data proportion responsive,warning=FALSE}
+#use the firezals_sum_zebi df, sigYN column
+#create success/failure column that is 0 and 1 instead of Y and N 
+firezals_sum_zebiFL$sigYN01<-with(firezals_sum_zebiFL,ifelse(sigYN == "Y",1,0))
+firezals_sum_zebiNCM$sigYN01<-with(firezals_sum_zebiNCM,ifelse(sigYN == "Y",1,0))
+
+#quick plot to view data
+ggplot(firezals_sum_zebiNCM,aes(x=sigYN01))+geom_histogram(stat="count")+facet_wrap(~Treatment)
+```
+
+The proportion of responsive units certainly looks different across the treatments, but let's see what happens when we incorporate stimulus type and random factors.
+
+## Field L
+### Model Creation
+```{r model creation proportion responsive FL,eval=FALSE}
+prop0<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Age)+(1|Hemisphere)+(1|Mass)+(1|DaysPostFledge)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiFL,family=binomial)
+summary(prop0)
+```
+
+Random effects removed due to low variance: Clutch, Days post fledge, ID.x
+
+``` {r Model comparison proportion responsive FL,eval=FALSE}
+prop1<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Hemisphere)+(1|Age)+(1|Mass),data=firezals_sum_zebiFL,family=binomial)
+prop2<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Age)+(1|Mass),data=firezals_sum_zebiFL,family=binomial)
+prop3<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+TypeFL+Mass+(1|Unit2)+(1|Age)+(1|Hemisphere),data=firezals_sum_zebiFL,family=binomial)
+prop4<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+TypeFL+Age+(1|Unit2)+(1|Mass)+(1|Hemisphere),data=firezals_sum_zebiFL,family=binomial)
+prop5<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+Mass+(1|Unit2)+(1|Age),data=firezals_sum_zebiFL,family=binomial)
+prop6<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+Mass+Age+(1|Unit2),data=firezals_sum_zebiFL,family=binomial)
+AICtab(prop0,prop1,prop2,prop3,prop4,prop5,prop6)
+```
+
+It seems like adding only Hemisphere as a predictor improves the fit of the model. prop2 is the best model fit (next lowest AIC is prop1 by 3.9 deltaAIC).
+
+### Model Diagnostics
+```{r Model Diagnostics proportion responsive FL}
+prop2FL<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Age)+(1|Mass),data=firezals_sum_zebiFL,family=binomial)
+
+simres <- simulateResiduals(prop2FL)
+plot(simres) 
+#plotResiduals(simres, form = firezals_sum_zebi$FamUnfamSpecies)
+#plotResiduals(simres, form = firezals_sum_zebi$Treatment)
+```
+
+Diagnostics look great!
+
+NOTE: The link scale for this model is logit. Original output will be on the log odds ratio scale. If converting to response scale, they will be in log odds.
+
+### Model Inference and Post Hoc Tests
+```{r Inference proportion responsive FL}
+summary(prop2FL)
+exp(0.9129 ) #effect of hemisphere
+exp(0.8995) #effect of unit type
+emmeans(prop2FL,pairwise~Treatment)
+emmeans(prop2FL,pairwise~Treatment,type="response")
+emmeans(prop2FL,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(prop2FL,pairwise~"FamUnfamSpecies","Treatment",type="response")
+emmeans(prop2FL,pairwise~"Treatment","FamUnfamSpecies")
+```
+
+## NCM
+### Model Creation
+```{r model creation proportion responsive NCM,eval=FALSE}
+prop0<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Age)+(1|Hemisphere)+(1|Mass)+(1|DaysPostFledge)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiNCM,family=binomial)
+summary(prop0)
+```
+
+Random effects removed due to low variance: Clutch, Hemisphere, Mass, ID.x
+
+``` {r Model comparison proportion responsive NCM,eval=FALSE}
+prop1<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Age)+(1|DaysPostFledge),data=firezals_sum_zebiNCM,family=binomial)
+prop2<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+Type0+Age+(1|Unit2)+(1|DaysPostFledge),data=firezals_sum_zebiNCM,family=binomial)
+prop3<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+Type0+DaysPostFledge+(1|Unit2)+(1|Age),data=firezals_sum_zebiNCM,family=binomial)
+prop4<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+Type0+DaysPostFledge+Age+(1|Unit2),data=firezals_sum_zebiNCM,family=binomial)
+AICtab(prop0,prop1,prop2,prop3,prop4)
+```
+
+prop1 and prop3 are the best models, but are not significantly different from each other in terms of fit to the data. They also both have the same number of df. The inferences are slightly different, though, so I will see if one has better diagnostics than the other to help decide which to use.
+
+### Model Diagnostics
+```{r Model Diagnostics proportion responsive NCM}
+prop1NCM<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Age)+(1|DaysPostFledge),data=firezals_sum_zebiNCM,family=binomial)
+prop3NCM<-glmmTMB(sigYN01~Treatment*FamUnfamSpecies+Type0+DaysPostFledge+(1|Unit2)+(1|Age),data=firezals_sum_zebiNCM,family=binomial)
+
+simres1 <- simulateResiduals(prop3NCM)
+plot(simres1) 
+simres2 <- simulateResiduals(prop1NCM)
+plot(simres2)
+```
+
+Diagnostics look great for prop3NCM and just OK for prop1NCM, so it looks like we have a winner.
+
+NOTE: The link scale for this model is logit. Original output will be on the log odds ratio scale. If converting to response scale, they will be in log odds.
+
+### Model Inference and Post Hoc Tests
+```{r Inference proportion responsive NCM}
+summary(prop3NCM)
+exp(0.61965) #effect of days post fledge
+emmeans(prop3NCM,pairwise~Treatment)
+emmeans(prop3NCM,pairwise~Treatment,type="response")
+emmeans(prop3NCM,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(prop3NCM,pairwise~"FamUnfamSpecies","Treatment",type="response")
+emmeans(prop3NCM,pairwise~"Treatment","FamUnfamSpecies")
+emmeans(prop3NCM,pairwise~Type0)
+emmeans(prop3NCM,pairwise~Type0,type="response")
+```
+
+---
+
+# ACCURACY
+
+The rcorr values have been normalized so that 0 is now "random chance." These data are continuous and bounded between [-1,1]. The data is right-skewed. Possible methods of modeling this data: gaussian or tweedie.
+
+```{r Histograms accuracy,include=FALSE,warning=FALSE}
+#remove units that drifted during the trial
+firezals_sum_zebiFL_PC<-subset(firezals_sum_zebiFL,Exclude4PC!="Y")
+firezals_sum_zebiNCM_PC<-subset(firezals_sum_zebiNCM,Exclude4PC!="Y")
+#view histogram
+hist(firezals_sum_zebiNCM_PC$normal_rcorr) #skewed to the right
+#hist(sqrt(firezals_sum_zebiNCM_PC$normal_rcorr))
+```
+
+## Field L
+### Model Creation
+Try gaussian and tweedie.
+```{r Test for best distribution accuracy FL,eval=FALSE}
+accgau<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Age)+(1|Hemisphere)+(1|Mass)+(1|DaysPostFledge)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiFL_PC)
+acctweed<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Age)+(1|Hemisphere)+(1|Mass)+(1|DaysPostFledge)+(1|Clutch)+(1|ID.x),family=tweedie,data=firezals_sum_zebiFL_PC)
+AICtab(accgau,acctweed)
+```
+
+The gaussian distribution fits the data best by far. Let's experiment with model specification.
+
+Random effects removed due to low variance: Age, DaysPostFledge, Clutch, and ID.x (maybe hemisphere and mass)
+
+```{r Model Creation accuracy FL,eval=FALSE}
+accgau1<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2),data=firezals_sum_zebiFL_PC)
+accgau2<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+(1|Unit2)+(1|Mass)+(1|Hemisphere),data=firezals_sum_zebiFL_PC)
+accgau3<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Mass+(1|Unit2)+(1|Hemisphere),data=firezals_sum_zebiFL_PC)
+accgau4<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),data=firezals_sum_zebiFL_PC)
+accgau4x<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2),data=firezals_sum_zebiFL_PC)
+accgau4disp<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),dispformula = ~1,data=firezals_sum_zebiFL_PC)
+accgau4disp1<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),dispformula = ~Treatment*FamUnfamSpecies,data=firezals_sum_zebiFL_PC)
+accgau4disp2<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),dispformula = ~Treatment*FamUnfamSpecies+TypeFL,data=firezals_sum_zebiFL_PC)
+accgau4disp3<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),dispformula = ~Treatment*FamUnfamSpecies+TypeFL+Hemisphere,data=firezals_sum_zebiFL_PC)
+
+AICtab(accgau,accgau1,accgau2,accgau3,accgau4,accgau4disp,accgau4disp1,accgau4disp2,accgau4disp3,accgau4x)
+```
+
+It looks like adding Hemisphere, but not Mass, as a predictor improves the fit. Let's check diagnostics. accgau4disp2 is best fitting model.
+
+### Model Diagnostics
+```{r Dianostics accuracy FL}
+accgau4disp2<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),dispformula = ~Treatment*FamUnfamSpecies+TypeFL,data=firezals_sum_zebiFL_PC)
+
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(accgau4disp2)
+plot(simres) 
+testOutliers(simres,type='bootstrap')  #ns
+```
+
+The KS test is significant and there are quantile deviations. After adding a dispersion parameter, this improved the model fit and the diagnostics. Let's also check effectiveness of removing outliers.
+
+```{r Removing outliers accuracy FL}
+firezals_sum_zebiFL_PC_outliersremoved<-cbind(firezals_sum_zebiFL_PC,simres$scaledResiduals) #scaled residuals based on accgau4disp2 model
+colnames(firezals_sum_zebiFL_PC_outliersremoved)[50]<-'scaledResiduals'
+firezals_sum_zebiFL_PC_outliersremoved<-subset(firezals_sum_zebiFL_PC_outliersremoved,scaledResiduals>0 & scaledResiduals<1)
+accgau4disp2FL_nooutliers<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+TypeFL+Hemisphere+(1|Unit2)+(1|Mass),dispformula = ~Treatment*FamUnfamSpecies+TypeFL,data=firezals_sum_zebiFL_PC_outliersremoved)
+
+AICtab(accgau4disp2FL_nooutliers,accgau4disp2)
+simres1 <- simulateResiduals(accgau4disp2FL_nooutliers)
+plot(simres1)
+```
+
+Removing outliers improves the model fit and diagnostics.  Moving to inference with accgau4disp2FL_nooutliers.
+
+NOTE: There is no link function for this model. The estimates are already on the response scale.
+
+### Model Inference and Post Hoc Tests
+```{r Inference accuracy FL}
+summary(accgau4disp2FL_nooutliers)
+emmeans(accgau4disp2FL_nooutliers,pairwise~Treatment)
+emmeans(accgau4disp2FL_nooutliers,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(accgau4disp2FL_nooutliers,pairwise~"Treatment","FamUnfamSpecies")
+```
+
+## NCM
+### Model Creation
+Try gaussian and tweedie.
+```{r Test for best distribution accuracy NCM,eval=FALSE}
+accgau<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Age)+(1|Hemisphere)+(1|Mass)+(1|DaysPostFledge)+(1|Clutch)+(1|ID.x),data=firezals_sum_zebiNCM_PC)
+acctweed<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Age)+(1|Hemisphere)+(1|Mass)+(1|DaysPostFledge)+(1|Clutch)+(1|ID.x),family=tweedie,data=firezals_sum_zebiNCM_PC)
+AICtab(accgau,acctweed)
+```
+
+The gaussian distribution fits the data best by far. Let's experiment with model specification.
+
+Random effects removed due to low variance: Age, Hemisphere, DaysPostFledge, Clutch, and ID.x 
+
+Mass is also low variance, so will experiment with keeping versus excluding.
+
+```{r Model Creation accuracy NCM,eval=FALSE}
+accgau0<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+(1|Unit2)+(1|Mass),data=firezals_sum_zebiNCM_PC)
+accgau1<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|Mass),data=firezals_sum_zebiNCM_PC)
+accgau1a<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|Mass),dispformula = ~Treatment*FamUnfamSpecies,data=firezals_sum_zebiNCM_PC)
+accgau2<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2),data=firezals_sum_zebiNCM_PC)
+accgau3<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+Hemisphere+Mass+(1|Unit2),data=firezals_sum_zebiNCM_PC)
+AICtab(accgau0,accgau1a,accgau1,accgau2,accgau3)
+```
+
+accgau1 best fit by 1.4 deltaAIC.
+
+### Model Diagnostics
+```{r Dianostics accuracy NCM}
+accgau1NCM<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|Mass),data=firezals_sum_zebiNCM_PC)
+#diagnostics check (Dharma package)
+simres <- simulateResiduals(accgau1NCM)
+plot(simres) 
+testOutliers(simres,type='bootstrap') #NS
+```
+
+The KS test is significant and there are quantile deviations. After bootstrapping, the outlier test is not significant. Including a dispersion parameter did not improve the model fit.
+
+```{r Removing outliers accuracy NCM}
+firezals_sum_zebiNCM_PC_outliersremoved<-cbind(firezals_sum_zebiNCM_PC,simres$scaledResiduals) #scaled residuals based on accgau1NCM model
+colnames(firezals_sum_zebiNCM_PC_outliersremoved)[50]<-'scaledResiduals'
+firezals_sum_zebiNCM_PC_outliersremoved<-subset(firezals_sum_zebiNCM_PC_outliersremoved,scaledResiduals>0 & scaledResiduals<1)
+accgau1NCM_nooutliers<-glmmTMB(normal_rcorr~Treatment*FamUnfamSpecies+Type0+Hemisphere+(1|Unit2)+(1|Mass),data=firezals_sum_zebiNCM_PC_outliersremoved)
+AICtab(accgau1NCM,accgau1NCM_nooutliers)
+plot(simres)
+simres2 <- simulateResiduals(accgau1NCM_nooutliers)
+plot(simres2)
+testOutliers(simres2,type='bootstrap') #NS
+plotResiduals(simres, form = firezals_sum_zebiNCM_PC$Treatment)
+plotResiduals(simres2, form = firezals_sum_zebiNCM_PC_outliersremoved$Treatment)
+```
+
+Removing outliers slightly improves diagnostics and significantly improves model fit, so I will move forward with the model without outliers: accgau1NCM_nooutliers.
+
+
+NOTE: There is no link function for this model. The estimates are already on the response scale.
+
+### Model Inference and Post Hoc Tests
+```{r Inference accuracy NCM}
+summary(accgau1NCM_nooutliers)
+emmeans(accgau1NCM_nooutliers,pairwise~Treatment)
+emmeans(accgau1NCM_nooutliers,pairwise~"FamUnfamSpecies","Treatment")
+emmeans(accgau1NCM_nooutliers,pairwise~"Treatment","FamUnfamSpecies")
+emmeans(accgau1NCM_nooutliers,pairwise~Type0)
+```
+
+
+---
+
+# REDUNDANCY (proportion selective)
+
+Really there are two proportions we want to model simultaneously here to see how they are changing together: 1. the number of zebra finch songs "selective" for out of 2 and 2. the number of Bengalese finch songs "selective" for out of 2. 
+
+```{r Data frame manipulation and data visualization Redundancy, warning=FALSE}
+dprime$dselective<- with(dprime, ifelse(dprime > 0.7, "Y", ifelse(dprime < -0.7, "Y", "N")))
+#summary BY UNIT to look at individual selectivity to the panel of stimuli
+dtutor_unit<-dplyr::count(dprime,Unit2,Region,Type0,Treatment,Species,dselective)
+#remove 'N' rows, then convert from long to wide format
+dtutor_unitY<-subset(dtutor_unit,dselective!="N") #Note: this will remove the units selective to zero stimuli
+dtutor_unit2<-reshape(dtutor_unitY,idvar = c("Unit2","Region","Type0","Treatment","dselective"),timevar = c("Species"), direction = "wide")
+#merge with dprime_wn to pull back the units which were selective to zero stimuli
+dprime_wn<-read.csv("/Users/username/Documents/Dissertation/Finch X-fostering (Ch. 2)/dprime_wn.csv", header=TRUE)
+dtutor_unit3<-merge(dtutor_unit2,dprime_wn,by=c("Unit2","Region","Type0","Treatment"),all.y=TRUE)
+#fill in NAs with 0
+dtutor_unit3$n.ZEBI[is.na(dtutor_unit3$n.ZEBI)]<- 0
+dtutor_unit3$n.BEFI[is.na(dtutor_unit3$n.BEFI)]<- 0
+#combine nZEBI and nBEFI columns
+dtutor_unit3<-unite(dtutor_unit3,Combination.Z_B,n.ZEBI,n.BEFI,sep = "_",remove=FALSE)
+#remove BEFI units
+dtutor_unit3_zebi<-subset(dtutor_unit3,Treatment!="BEFI")
+#Make "normal" treatment the reference level
+dtutor_unit3_zebi$Treatment<-relevel(as.factor(dtutor_unit3_zebi$Treatment),ref=2)
+
+
+#count number of units in each treatment group with each combination of selectivity for ZEBI/BEFI songs
+dunitcount<-dplyr::count(dtutor_unit3,Region,Treatment,n.ZEBI,n.BEFI) #Could also choose to group by unit type?
+#create column of proportions rather than counts 
+counts<-as.data.frame(dunitcount %>% group_by(Region,Treatment) %>% summarise(sum = sum(n))) #get sum # of units for each region/treatment combination to use in calculation
+# add it as a new column to the df
+dunitcount2<-merge(dunitcount,counts,by=c("Region","Treatment"),all.x=TRUE)
+#calculate the proportion of units with that combination of response to ZEBI/BEFI songs
+dunitcount2$proportion<-dunitcount2$n/dunitcount2$sum
+#merge nZEBI and nBEFI columns for plotting
+dunitcount2<-unite(dunitcount2,Combination.Z_B,n.ZEBI,n.BEFI,sep = "_",remove=FALSE)
+#remove BEFI units again
+dunitcount2_zebi<-subset(dunitcount2,Treatment!="BEFI")
+#Make "normal" treatment the reference level
+dunitcount2_zebi$Treatment<-relevel(as.factor(dunitcount2_zebi$Treatment),ref=2)
+
+#plot
+#change order of treatments
+neworder <- c("normal","xfostered","Isolate")
+dunitcount2_zebi <- arrange(transform(dunitcount2_zebi,Treatment=factor(Treatment,levels=neworder)),Treatment)
+ggplot(dunitcount2_zebi,aes(x=Combination.Z_B,y=proportion,fill=Treatment))+facet_wrap(~Region)+
+  geom_bar(position="dodge",stat="identity")+theme_bw()+xlab("#ZEBI_#BEFI")+ylab("Proportion")+theme(axis.text.y=element_text(size=14),axis.text.x=element_text(size=11),axis.title=element_text(size="14"))+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+
+### CDF analysis
+```{r CDF redundancy}
+#cdf plot
+ggplot(dtutor_unit3_zebi, aes(x=Combination.Z_B, group =Treatment,color=Treatment)) + stat_ecdf()+facet_wrap(~Region)
+
+#change Combination.Z_B to a numeric variable
+dtutor_unit3_zebi$combnum<-with(dtutor_unit3_zebi,ifelse(Combination.Z_B == "0_0",1,
+                                ifelse(Combination.Z_B == "0_1",2, ifelse(Combination.Z_B == "0_2",3,
+                                ifelse(Combination.Z_B == "1_0",4,ifelse(Combination.Z_B == "1_1",5,
+                                ifelse(Combination.Z_B == "1_2",6,ifelse(Combination.Z_B == "2_0",7,
+                                ifelse(Combination.Z_B == "2_1",8,9)))))))))
+
+#levene test
+levene.redun.aov<-aov(combnum~Treatment*Region,dtutor_unit3_zebi)
+summary(levene.redun.aov)
+TukeyHSD(levene.redun.aov)
+```
+
+
+
+# BEHAVIOR
+
+The sample size here is super low per treatment (N = 5, 5, and 3), so I will use a non-parametric test.
+
+### Wilcoxon-signed rank tests for each treatment
+```{r Wilcoxon tests behavior}
+#Normal birds
+clutchcdfg_normal<-subset(clutchcdfg,Treatment=="Normal")
+clutchcdfg_normalwide<-reshape(clutchcdfg_normal, idvar = c("ID","Clutch","Treatment"), timevar = "Species", direction = "wide")
+wilcox.test(clutchcdfg_normalwide$Standstim.BEFI,clutchcdfg_normalwide$Standstim.ZEBI,paired=TRUE)
+
+#Isolate birds
+clutchcdfg_isolate<-subset(clutchcdfg,Treatment=="Isolate")
+clutchcdfg_isolatewide<-reshape(clutchcdfg_isolate, idvar = c("ID","Clutch","Treatment"), timevar = "Species", direction = "wide")
+wilcox.test(clutchcdfg_isolatewide$Standstim.BEFI,clutchcdfg_isolatewide$Standstim.ZEBI,paired=TRUE)
+
+#Xfostered birds
+clutchcdfg_xfostered<-subset(clutchcdfg,Treatment=="Xfostered")
+clutchcdfg_xfosteredwide<-reshape(clutchcdfg_xfostered, idvar = c("ID","Clutch","Treatment"), timevar = "Species", direction = "wide")
+wilcox.test(clutchcdfg_xfosteredwide$Standstim.BEFI,clutchcdfg_xfosteredwide$Standstim.ZEBI,paired=TRUE)
+```
+
+We can't detect a differential response to ZEBI and BEFI songs in any treatment group, which is not surprising given the small sample sizes. We can still discuss the trends in the means? Try plotting means along with the boxplots?
+
+Check for a correlation between ephys data and behavioral data.
+```{r behavior-ephys correlation}
+## WITH ZSCORES
+#Average zscores across a bird (only use NCM units and only use unfamiliar zebra finch stimuli)
+firezals_sum_zebiunfam<-subset(firezals_sum_zebi,FamUnfamSpecies=="Unfamiliar_ZEBI")
+firezals_sum_zebiunfam_NCM<-subset(firezals_sum_zebiunfam,Region!="FL")
+firezals_sum_zebiunfam_NCM_bird<-aggregate(Z_score ~ ID.x + Species, data = firezals_sum_zebiunfam_NCM, mean) 
+alldata_zscore<-merge(firezals_sum_zebiunfam_NCM_bird,clutchcdfg,by.x=c("ID.x","Species"),by.y = c("ID","Species"))
+cor.test(alldata_zscore$Z_score, alldata_zscore$Standstim, method = 'pearson') #0.08 --> not strong
+ggplot(alldata_zscore,aes(x=Z_score,y=Standstim,color=Treatment))+geom_point()+geom_smooth(method="lm")
+#just normal birds
+alldata_zscore_normal<-subset(alldata_zscore,Treatment=="Normal")
+cor.test(alldata_zscore_normal$Z_score, alldata_zscore_normal$Standstim, method = 'pearson') #0.86 --> strong positive correlation
+
+
+## WITH DPRIME
+#Average dprime across a bird (only use NCM units and only use unfamiliar zebra finch stimuli)
+dprime_zebiunfam<-subset(dprime_zebi,FamUnfamSpecies=="Unfamiliar_ZEBI")
+dprime_zebiunfam_NCM<-subset(dprime_zebiunfam,Region!="FL")
+dprime_zebiunfam_NCM_bird<-aggregate(dprime ~ ID.x + Species, data = dprime_zebiunfam_NCM, mean) 
+alldata_dprime<-merge(dprime_zebiunfam_NCM_bird,clutchcdfg,by.x=c("ID.x","Species"),by.y = c("ID","Species"))
+cor.test(alldata_dprime$dprime, alldata_dprime$Standstim, method = 'pearson') # 0.21
+ggplot(alldata_dprime,aes(x=dprime,y=Standstim,color=Treatment))+geom_point()+geom_smooth(method="lm",se=F)
+#just normal treatment birds
+alldata_dprime_normal<-subset(alldata_dprime,Treatment=="Normal")
+cor.test(alldata_dprime_normal$dprime, alldata_dprime_normal$Standstim, method = 'pearson') # 0.99
+```
+
+
+
+#REGION CORRELATION BASED ON RESPONSE STRENGTH DURING STIMULI
+
+```{r }
+##Correlation of simultaneous firing rates in FL and NCM. 
+#Use frates_wide2 df (already non-auditory units excluded). First renumber Presentation column to count by stimulus, not through the whole trial
+frates_wide2 <- frates_wide2%>% group_by(Unit2,Stimulus) %>% mutate(Presentation=row_number())
+#Create new column to represent change in firing rate during stimulus vs before stimulus
+#(stim_fr-base_fr)/(mean base_fr for that unit-stimulus combo)
+#First calculate mean base_fr and merge it with the df, then calculate change
+#stimbasemean<-as.data.frame(frates_wide2 %>% group_by(Unit2,Stimulus) %>% summarise(meanbase_fr=mean(base_fr)))
+#frates_wide3<-merge(frates_wide2,stimbasemean,by=c("Unit2","Stimulus"),all.x=TRUE)
+frates_wide3$RS<-frates_wide3$stim_fr-frates_wide3$base_fr
+#Calculate average FRchange for each region/trial/stimulus/presentation. Will calculate a mean if multiple units found in the same region in the same trial
+frates_RS<-as.data.frame(frates_wide3 %>% group_by(ID,Region,Trial,Stimulus,Presentation) %>% summarise(RS=mean(RS)))
+#Add summary df to get treatment info
+frates_wide4<-merge(frates_RS,summary[,c("ID","Treatment")],by=c("ID"),all.x=TRUE,all.y=FALSE)
+frates_wide4 <- frates_wide4 %>% distinct() #removes duplicate rows created from last line of code
+#Add stimIDs to get FamUnfam info
+stiminfo<-merge(stimframe,stimIDs,by=c("StimSet"),all.y=TRUE)
+frates_wide4$Stimulus<-gsub("[?]","",frates_wide4$Stimulus)
+frates_wide4<-merge(frates_wide4,stiminfo,by.x=c("ID","Region","Trial","Stimulus"),by.y=c("ID.x","Region","Trial","StimNumber"),all.x=TRUE)
+#convert to wide format so that FL and NCM from same presentation are in the same row
+frates_wide4_FL<-subset(frates_wide4,Region=="FL")
+frates_wide4_NCM<-subset(frates_wide4,Region=="NCM")
+frates_wide4_wide<-merge(frates_wide4_FL,frates_wide4_NCM,by=c("ID","Trial","Stimulus","Presentation","Treatment"))
+#the above line should filter out trials with only units from one region
+#merge FamUnfam and Species columns
+frates_wide4_wide<-unite(frates_wide4_wide,FamUnfamSpecies,FamUnfam.y,Species.y, sep = "_",remove=FALSE)
+#calculate distance from 1:1 line
+res<-resid(lm(frates_wide4_wide$RS.y-frates_wide4_wide$RS.x ~ 0))
+frates_wide4_wide<-cbind(frates_wide4_wide,res)
+#plots
+ggplot(frates_wide4_wide,aes(x=RS.x,y=RS.y,color=Treatment))+geom_point(alpha=0.3)+geom_abline(slope=1,intercept=0,lty=2)+labs(x="Field L RS", y="NCM RS")+geom_smooth(method="lm")
+ggplot(frates_wide4_wide,aes(x=Treatment,y=res,color=Treatment))+geom_boxplot()+labs(x="", y="Distance from 1:1 line")
+```
+
+```{r region correlation statistical analysis}
+kruskal.test(res~Treatment,data=frates_wide4_wide) 
+library(dunn.test)
+dunn.test(frates_wide4_wide$res,frates_wide4_wide$Treatment,method = "Bonferroni")
+
+frates_wide4_wide %>% 
+  group_by(Treatment) %>% 
+  summarize(mean = mean(res))
+```
+
+
+```{r glmm for region correlation, eval=FALSE}
+model<-glmmTMB(res~Treatment+FamUnfamSpecies+(1|ID),data=frates_wide4_wide)
+#model1<-glmmTMB(res~Treatment*FamUnfamSpecies+(1|ID),data=frates_wide4_wide) #does not converge
+model2<-glmmTMB(res~Treatment+FamUnfamSpecies+(1|ID),data=frates_wide4_wide,family=tweedie)
+#model3<-glmmTMB(res~Treatment*FamUnfamSpecies+(1|ID),data=frates_wide4_wide,family=tweedie) #does not converge
+AICtab(model,model2 #model 2 has much lower AIC, but diagnostics are much worse
+
+#Diagnostics
+simres <- simulateResiduals(model)
+plot(simres) 
+#testDispersion(simres) 
+#testZeroInflation(simres) 
+testOutliers(simres,type='bootstrap') #outliers significant
+
+#removing outliers
+frates_wide4_wide_outliersremoved<-cbind(frates_wide4_wide,simres$scaledResiduals) #scaled residuals based on "model"
+colnames(frates_wide4_wide_outliersremoved)[24]<-'scaledResiduals' #might need to be 22?
+frates_wide4_wide_outliersremoved<-subset(frates_wide4_wide_outliersremoved,scaledResiduals>0 & scaledResiduals<1)
+model_nooutliers<-glmmTMB(res~Treatment+FamUnfamSpecies+(1|ID),data=frates_wide4_wide_outliersremoved)
+AICtab(model,model2,model_nooutliers)
+simres2 <- simulateResiduals(model_nooutliers)
+plot(simres2)
+testOutliers(simres2,type='bootstrap') #outliers significant
+
+#Inference
+emmeans(model_nooutliers,pairwise~Treatment)
+```
+
